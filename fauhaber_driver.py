@@ -37,15 +37,26 @@ network= canopen.Network()
 network.connect(interface= "pcan", channel= "PCAN_USBBUS1", bitrate= 250000)
 node = network.add_node(3, r'C:\Users\maria\Documents\VS code projects\robotics\605.3150.69-C.eds')
 
-node.nmt.state= 'OPERATIONAL'
-node.sdo['Controlword'].raw= 0x0006
+def wait_status(mask, value, timeout=2.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if node.sdo[0x6041].raw & mask == value:
+            return
+        time.sleep(0.01)
+    raise TimeoutError(f"Statusword = 0x{node.sdo[0x6041].raw:04X}")
 
-node.sdo['Controlword'].raw= 0x0007
+def enable_drive():
+    if node.sdo[0x6041].raw & 0x008F == 0x0008:            # fault -> reset
+        node.sdo[0x6040].raw = 0x0080                      # Controlword
+        time.sleep(0.1)
+    node.sdo[0x6040].raw = 0x0006                          # Shutdown
+    wait_status(0x006F, 0x0021)                            # Ready to switch on
+    node.sdo[0x6040].raw = 0x0007                          # Switch on
+    wait_status(0x006F, 0x0023)                            # Switched on
+    node.sdo[0x6040].raw = 0x000F                          # Enable operation
+    wait_status(0x006F, 0x0027)           
 
-node.sdo['Controlword'].raw= 0x000F
-
-
-
+#enable_drive()
 
 def start_func():
 
@@ -80,7 +91,7 @@ def start_func():
         node.sdo['Controlword'].raw= 0x001F
         time.sleep(0.1)
         node.sdo[0x6060].raw= 1  #initialize profile position mode
-        node.sdo[0x607A].raw= 90 #new position
+        node.sdo[0x607A].raw= 1000 #new position
         node.sdo['Controlword'].raw= 0x000F
         node.sdo['Controlword'].raw= 0x007F
         print("stOOpped")
@@ -166,60 +177,31 @@ confirmed_vel  ={"Target Velocity": None}
 
 global pos_value
 
-def wait_status(mask, value, timeout=2.0):
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        if node.sdo[0x6041].raw & mask == value:
-            return
-        time.sleep(0.01)
-    raise TimeoutError(f"Statusword = 0x{node.sdo[0x6041].raw:04X}")
+
 
 motor_lock = threading.Lock()   
 
-def abs_pos(value, set_status):
-    """Runs in a background thread so the window never freezes."""
-    if not motor_lock.acquire(blocking=False):
-        root.after(0, lambda: set_status("Motor busy, try again", error=True))
-        return
-    try:
-        root.after(0, lambda: set_status(f"Moving to {value}..."))
-        node.sdo[0x6040].raw = 0x0006
-        wait_status(0x006F, 0x0021)
-        node.sdo[0x6040].raw = 0x0007
-        wait_status(0x006F, 0x0023)
-        node.sdo[0x6040].raw = 0x000F
-        wait_status(0x006F, 0x0027)
-        node.sdo[0X607A].raw = value
-        node.sdo[0x6040].raw = 0x000F           # bit 4 low
-        node.sdo[0x6040].raw = 0x003F           # rising edge: absolute, immediate
-        wait_status(0x1000, 0x1000)                  # bit 12: set-point acknowledged
-        """node.sdo[0x6040].raw = 0x000F           # drop bit 4 again
-        wait_status(0x0400, 0x0400, timeout=60)      # bit 10: target reached
-        actual = node.sdo[0x6064].raw"""
-        root.after(0, lambda: set_status(f"Arrived at {actual}"))
-    except Exception as e:
-        root.after(0, lambda: set_status(f"Move failed: {e}", error=True))
+def move_to(position, relative=False, timeout=30.0):
+    node.sdo[0x607A].raw = int(position)                   # Target position
+    base = 0x4F if relative else 0x0F                      # bit 6 = relative
+    node.sdo[0x6040].raw = base | 0x10                     # bit 4 = new set-point
+    node.sdo[0x6040].raw = base                            # clear bit 4
+    t0 = time.time()
+    while not (node.sdo[0x6041].raw & 0x0400):             # bit 10 = target reached
+        if time.time() - t0 > timeout:
+            raise TimeoutError("target not reached")
+        time.sleep(0.02)
+
     
 
 
-"""global value
 
-def abs_pos(value) :
-    try:
-        node.sdo[0x6060].raw= 1 #initialize profile position mode
-        time.sleep(0.1)
-        node.sdo[0x607A].raw= value #new position
-        time.sleep(0.1)
-        node.sdo['Controlword'].raw= 0x000F
-        node.sdo['Controlword'].raw= 0x003F
-    except Exception as e:
-        print(f"Error in position : {e}")    """
 
 def on_confirm_pos(name, value):
     """Called when a Confirm button is pressed. Put your own code here."""
     confirmed_pos[name] = value
     print(f"{name} confirmed: {value}")
-    threading.Thread(target=abs_pos, args=(value,), daemon=True).start()
+    threading.Thread(target=pos_value, args=(value,), daemon=True).start()
 
 def on_confirm_vel(name, value):
     """Called when a Confirm button is pressed. Put your own code here."""
@@ -323,7 +305,7 @@ def make_slider(parent, title, min_value, max_value, initial=0):
     button.bind("<Button-1>", lambda e: button.config(bg=DARK_PINK))
     button.bind("<ButtonRelease-1>", lambda e: (button.config(bg=DEEP_PINK), confirmpos()))
     button.bind("<ButtonRelease-1>", lambda e: (button.config(bg=DEEP_PINK), on_confirm_pos()))
-    button.bind("<ButtonRelease-1>", lambda e: (button.config(bg=DEEP_PINK), abs_pos(pos_value)))
+    button.bind("<ButtonRelease-1>", lambda e: (button.config(bg=DEEP_PINK), move_to(pos_value)))
     button.bind("<ButtonRelease-1>", lambda e: (button.config(bg=DEEP_PINK), confirmvel()))
     button.bind("<Enter>", lambda e: button.config(bg="#FF3EA5"))
     button.bind("<Leave>", lambda e: button.config(bg=DEEP_PINK))
