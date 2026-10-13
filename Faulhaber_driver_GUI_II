@@ -1,0 +1,532 @@
+import math
+import os
+import threading
+import time
+import tkinter as tk
+from tkinter import messagebox, ttk
+
+import canopen
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+NODE_ID = 3                      # node ID set on the Faulhaber drive
+EDS_FILENAME = '605.3150.69-C.eds'              # e.g. 'faulhaber.eds'; None = first *.eds found next to this script
+CAN_INTERFACE = 'pcan'           # 'pcan', 'kvaser', 'vector', 'socketcan', ...
+CAN_CHANNEL = 'PCAN_USBBUS1'     # e.g. 'can0' for socketcan
+CAN_BITRATE = 250000
+
+
+
+
+POS_MIN, POS_MAX = 0, 65000      # allowed range in drive units (increments)
+
+# Conversion between millimetres and drive units.
+# SET THIS TO MATCH YOUR MOTOR: how many position units the drive counts per mm of travel.
+# (1000.0 is only a placeholder, i.e. 0-90000 units = 0-90 mm.)
+UNITS_PER_MM = 1000.0
+SPEED_MIN_PCT, SPEED_MAX_PCT = 0, 100   # speed is entered as a percentage
+VELOCITY_AT_100_PCT = 500               # velocity (drive units) that corresponds to 100 %
+MOVE_TIMEOUT = 60                # seconds to wait for "target reached"
+GUI_TITLE = "Faulhaber Linear Motor Control"
+MONITOR_INTERVAL = 0.1           # seconds between state readings
+MAX_TABLE_ROWS = 1000            # oldest rows are dropped beyond this
+CURRENT_HIGHLIGHT = 30          # table rows with a current above this are highlighted yellow
+CURRENT_LIMIT = 1200             # above this current the motor is shut down (emergency stop)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+network = canopen.Network()
+node = None
+
+# Set by the Stop button; the running motor routine checks it and aborts
+stop_event = threading.Event()
+
+# Set while an over-current emergency shutdown is active: no routine may re-enable the drive.
+# It is cleared when the user presses Start again.
+emergency_event = threading.Event()
+
+
+class StopRequested(Exception):
+    """Raised inside a motor routine when the user pressed Stop."""
+
+
+def check_stop():
+    if stop_event.is_set():
+        raise StopRequested()
+
+
+def halt_motor():
+    """Stop all motion immediately (works in velocity and position mode)."""
+    if emergency_event.is_set():
+        return    # the drive was shut down; the halt command would re-enable it
+    try:
+        node.sdo['Target Velocity'].raw = 0       # stops velocity mode
+    except Exception:
+        pass
+    node.sdo['Controlword'].raw = 0x010F          # halt bit: decelerate to standstill, keep drive enabled
+
+
+def shutdown_motor():
+    """Power the drive stage off (Controlword 'shutdown'), same command as endfunc() but without the delay."""
+    node.sdo['Controlword'].raw = 0x0006
+
+
+def mm_to_units(mm):
+    return round(mm * UNITS_PER_MM)
+
+
+def units_to_mm(units):
+    return units / UNITS_PER_MM
+
+
+def add_sdo_lock(sdo):
+    """Make every SDO read/write atomic, so the state monitor (own thread) and the
+    motor routines (another thread) can share the CAN bus without mixing up replies."""
+    lock = threading.RLock()
+    for name in ('upload', 'download'):
+        original = getattr(sdo, name)
+
+        def wrapped(*args, _original=original, **kwargs):
+            with lock:
+                return _original(*args, **kwargs)
+
+        setattr(sdo, name, wrapped)
+
+
+def find_eds():
+    if EDS_FILENAME:
+        path = os.path.join(BASE_DIR, EDS_FILENAME)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"EDS file not found: {path}")
+        return path
+    candidates = sorted(f for f in os.listdir(BASE_DIR) if f.lower().endswith('.eds'))
+    if not candidates:
+        raise FileNotFoundError(f"No .eds file found in {BASE_DIR}")
+    return os.path.join(BASE_DIR, candidates[0])
+
+
+# ---------------------------------------------------------------------------
+# Motor functions
+# ---------------------------------------------------------------------------
+def start_func():
+    node.nmt.state = 'OPERATIONAL'
+    node.sdo['Controlword'].raw = 0x0006
+    node.sdo['Controlword'].raw = 0x0007
+    node.sdo['Controlword'].raw = 0x000F
+
+    fw_version = node.sdo[0x100A].raw
+    print(f"Current Firmware: {fw_version}")
+
+    # initialize profile velocity mode
+    node.sdo[0x6060].raw = 3
+
+    I_current = node.sdo['Current Actual Value'].raw
+    posi = node.sdo['Position Actual Value'].raw
+    print(f"Initial Current value: {I_current}")
+
+    # drive slowly towards the end stop until the current rises
+    node.sdo['Target Velocity'].raw = -10
+    t0 = time.time()
+    while I_current < 200:
+        check_stop()
+        if time.time() - t0 > 30:
+            node.sdo['Target Velocity'].raw = 0
+            raise TimeoutError("End stop not found within 30 s")
+        I_current = node.sdo['Current Actual Value'].raw
+
+    posi = node.sdo['Position Actual Value'].raw
+    print(f"pos: {posi}")
+    node.sdo['Target Velocity'].raw = 0
+    node.sdo['Controlword'].raw = 0x001F
+    time.sleep(0.1)
+    node.sdo[0x6060].raw = 1       # profile position mode
+    node.sdo[0x607A].raw = 1000    # move away from the end stop
+    node.sdo['Controlword'].raw = 0x000F
+    node.sdo['Controlword'].raw = 0x007F
+    print("stopped")
+    posi = node.sdo['Position Actual Value'].raw
+    print(f"pos: {posi}")
+
+    time.sleep(0.1)
+
+    vel = node.sdo['Velocity Actual Value'].raw
+    print(f"Velocity: {vel}")
+
+    I_current = node.sdo['Current Actual Value'].raw
+    print(f"Current value: {I_current}")
+    if I_current == 0:
+        print("Zero Current")
+
+    check_stop()
+
+    # homing
+    node.sdo[0x6060].raw = 6       # homing mode
+    node.sdo[0x6098].raw = 35      # homing method 35
+    node.sdo['Controlword'].raw = 0x000F
+    node.sdo['Controlword'].raw = 0x001F
+    posi = node.sdo['Position Actual Value'].raw
+    print(f"pos: {posi}")
+
+
+def endfunc():
+    time.sleep(1)
+    node.sdo['Controlword'].raw = 0x0006
+
+
+def move_to(position, velocity):
+    node.sdo[0x6060].raw = 1              # profile position mode
+    node.sdo[0x6081].raw = velocity       # profile velocity
+    node.sdo[0x607A].raw = position       # target position
+    node.sdo['Controlword'].raw = 0x000F
+    node.sdo['Controlword'].raw = 0x003F  # new set-point, absolute, start immediately
+
+    t0 = time.time()
+    while True:
+        check_stop()
+        sw = node.sdo[0x6041].raw
+        if sw & 0x0400:                   # target reached
+            break
+        if time.time() - t0 > MOVE_TIMEOUT:
+            raise TimeoutError("Target not reached in time")
+        time.sleep(0.05)
+
+    node.sdo['Controlword'].raw = 0x000F  # clear the new set-point bit
+    return node.sdo['Position Actual Value'].raw
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.started = False
+        self.busy = False
+
+        root.title(GUI_TITLE)
+        root.resizable(False, False)
+
+        tk.Label(root, text=GUI_TITLE, font=("Segoe UI", 16, "bold")).pack(padx=20, pady=(15, 10))
+
+        # Start / End buttons directly under the title
+        btn_frame = tk.Frame(root)
+        btn_frame.pack(pady=5)
+        self.start_btn = tk.Button(btn_frame, text="Start", width=12, command=self.on_start)
+        self.start_btn.grid(row=0, column=0, padx=5)
+        self.end_btn = tk.Button(btn_frame, text="End", width=12, command=self.on_end)
+        self.end_btn.grid(row=0, column=1, padx=5)
+        self.stop_btn = tk.Button(btn_frame, text="STOP", width=12, bg="#c62828", fg="white",
+                                  activebackground="#8e0000", activeforeground="white",
+                                  command=self.on_stop)
+        self.stop_btn.grid(row=0, column=2, padx=5)
+
+        # Position / velocity inputs
+        form = tk.Frame(root)
+        form.pack(padx=20, pady=10)
+        tk.Label(form, text=f"Target position ({units_to_mm(POS_MIN):g}-{units_to_mm(POS_MAX):g} mm):").grid(row=0, column=0, sticky="e", pady=3)
+        self.pos_entry = tk.Entry(form, width=12)
+        self.pos_entry.grid(row=0, column=1, padx=5)
+        tk.Label(form, text=f"Speed ({SPEED_MIN_PCT}-{SPEED_MAX_PCT} %):").grid(row=1, column=0, sticky="e", pady=3)
+        self.vel_entry = tk.Entry(form, width=12)
+        self.vel_entry.grid(row=1, column=1, padx=5)
+
+        self.move_btn = tk.Button(root, text="Move", width=26, command=self.on_move)
+        self.move_btn.pack(pady=5)
+
+        self.status = tk.StringVar(value="Connecting...")
+        tk.Label(root, textvariable=self.status, fg="gray25", wraplength=320).pack(padx=20, pady=(10, 15))
+
+        # Live motor state table (a new row is added whenever a value changes)
+        state_frame = tk.LabelFrame(root, text="Motor state", padx=8, pady=6)
+        state_frame.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+
+        columns = ("time", "position_mm", "position", "velocity", "current")
+        headings = ("Time", "Position (mm)", "Position (units)", "Velocity", "Current")
+        self.table = ttk.Treeview(state_frame, columns=columns, show="headings", height=8)
+        for col, head in zip(columns, headings):
+            self.table.heading(col, text=head)
+            self.table.column(col, width=100 if col == "time" else 120, anchor="center")
+        # Workaround for a Tk 8.6.9 bug where Treeview tag colours are ignored on some systems
+        style = ttk.Style()
+
+        def fixed_map(option):
+            return [e for e in style.map("Treeview", query_opt=option) if e[:2] != ("!disabled", "!selected")]
+
+        style.map("Treeview", foreground=fixed_map("foreground"), background=fixed_map("background"))
+        self.table.tag_configure("high_current", background="yellow", foreground="black")
+        self.table.tag_configure("alarm", background="red", foreground="white")
+
+        scroll = ttk.Scrollbar(state_frame, orient="vertical", command=self.table.yview)
+        self.table.configure(yscrollcommand=scroll.set)
+        self.table.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        table_buttons = tk.Frame(state_frame)
+        table_buttons.grid(row=1, column=0, sticky="e", pady=(6, 0))
+        self.record_btn = tk.Button(table_buttons, text="Stop recording", width=16,
+                                    command=self.toggle_recording)
+        self.record_btn.pack(side="left", padx=5)
+        tk.Button(table_buttons, text="Clear table",
+                  command=lambda: self.table.delete(*self.table.get_children())
+                  ).pack(side="left")
+        state_frame.columnconfigure(0, weight=1)
+
+        self.monitor_stop = threading.Event()
+        self.monitor_thread = None
+        self.recording = threading.Event()   # set = data is being recorded in the table
+        self.recording.set()
+
+        self.update_buttons()
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.connect()
+
+    # -- helpers ----------------------------------------------------------
+    def set_status(self, text):
+        self.root.after(0, lambda: self.status.set(text))
+
+    def update_buttons(self):
+        connected = node is not None
+        self.start_btn.config(state="normal" if connected and not self.started and not self.busy else "disabled")
+        self.end_btn.config(state="normal" if connected and self.started and not self.busy else "disabled")
+        self.move_btn.config(state="normal" if connected and self.started and not self.busy else "disabled")
+        # Stop is available at any time, whether the motor is moving or not
+        self.stop_btn.config(state="normal" if connected else "disabled")
+
+    def run_in_thread(self, work, on_success=None):
+        """Run a blocking motor call off the GUI thread so the window stays responsive."""
+        self.busy = True
+        stop_event.clear()
+        self.update_buttons()
+
+        def target():
+            try:
+                result = work()
+                self.root.after(0, lambda: self.finish(None, on_success, result))
+            except StopRequested:
+                # the stop is carried out here, in the thread that owns the CAN/SDO traffic
+                try:
+                    halt_motor()
+                    err = None
+                except Exception as e:
+                    err = e
+                self.root.after(0, lambda: self.finish_stopped(err))
+            except Exception as e:
+                self.root.after(0, lambda err=e: self.finish(err, None, None))
+
+        threading.Thread(target=target, daemon=True).start()
+
+    def finish(self, error, on_success, result):
+        self.busy = False
+        if error is not None:
+            self.status.set(f"Error: {error}")
+        elif on_success and not emergency_event.is_set():
+            on_success(result)
+        self.update_buttons()
+
+    def finish_stopped(self, error):
+        self.busy = False
+        if error is not None:
+            self.status.set(f"Stop failed: {error}")
+        elif not emergency_event.is_set():     # after an emergency the alarm message stays
+            self.status.set("Motor stopped by user.")
+        self.update_buttons()
+
+    # -- actions ----------------------------------------------------------
+    def connect(self):
+        global node
+        try:
+            eds_path = find_eds()
+            network.connect(interface=CAN_INTERFACE, channel=CAN_CHANNEL, bitrate=CAN_BITRATE)
+            node = network.add_node(NODE_ID, eds_path)
+            add_sdo_lock(node.sdo)
+            self.start_monitor()
+            self.status.set(f"Connected (node {NODE_ID}, EDS: {os.path.basename(eds_path)}). Press Start.")
+        except Exception as e:
+            self.status.set(f"Connection failed: {e}")
+        self.update_buttons()
+
+    # -- state monitor ----------------------------------------------------
+    def start_monitor(self):
+        self.monitor_stop.clear()
+        self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
+        self.monitor_thread.start()
+
+    def monitor_loop(self):
+        last = None
+        while not self.monitor_stop.is_set():
+            # The drive is always read, even when table recording is stopped,
+            # because the over-current protection depends on it.
+            try:
+                values = (
+                    node.sdo['Position Actual Value'].raw,
+                    node.sdo['Velocity Actual Value'].raw,
+                    node.sdo['Current Actual Value'].raw,
+                )
+            except Exception:
+                values = None          # drive busy / not ready: just try again
+
+            if values is not None and values[2] > CURRENT_LIMIT and not emergency_event.is_set():
+                self.emergency_shutdown(values)
+
+            if not self.recording.is_set():
+                last = None            # on resume, record the current state straight away
+            elif values is not None and values != last:
+                last = values
+                now = time.time()
+                stamp = time.strftime('%H:%M:%S', time.localtime(now)) + f".{int(now * 1000) % 1000:03d}"
+                try:
+                    self.root.after(0, lambda v=values, s=stamp: self.add_row(s, v))
+                except RuntimeError:
+                    return             # window already closed
+            self.monitor_stop.wait(MONITOR_INTERVAL)
+
+    def add_row(self, stamp, values):
+        pos_units, vel, cur = values
+        tags = ("high_current",) if cur > CURRENT_HIGHLIGHT else ()
+        self.table.insert("", "end", tags=tags,
+                          values=(stamp, f"{units_to_mm(pos_units):.3f}", pos_units, vel, cur))
+        children = self.table.get_children()
+        if len(children) > MAX_TABLE_ROWS:
+            self.table.delete(*children[:len(children) - MAX_TABLE_ROWS])
+        self.table.see(self.table.get_children()[-1])
+
+    def emergency_shutdown(self, values):
+        """Called from the monitor thread when the current exceeds CURRENT_LIMIT."""
+        emergency_event.set()
+        stop_event.set()               # a running routine aborts at its next check
+        self.recording.clear()         # stop recording
+
+        error = None
+        for _ in range(3):             # shut the motor down first, retry if the bus hiccups
+            try:
+                shutdown_motor()
+                error = None
+                break
+            except Exception as e:
+                error = e
+        try:
+            self.root.after(0, lambda v=values, err=error: self.on_overcurrent(v, err))
+        except RuntimeError:
+            return
+
+        # A routine that was in the middle of a command sequence must not be able to re-enable the
+        # drive after the shutdown, so wait for it to finish aborting and shut down once more.
+        deadline = time.time() + 3
+        while self.busy and time.time() < deadline:
+            time.sleep(0.05)
+        try:
+            shutdown_motor()
+        except Exception:
+            pass
+
+    def on_overcurrent(self, values, error):
+        """GUI part of the emergency stop (runs in the GUI thread)."""
+        self.started = False
+        now = time.time()
+        stamp = time.strftime('%H:%M:%S', time.localtime(now)) + f".{int(now * 1000) % 1000:03d}"
+        # The message is split over two cells so it fits the narrow columns
+        self.table.insert("", "end", tags=("alarm",),
+                          values=(stamp, "CURRENT OVERFLOW-", "emergency stop", "", values[2]))
+        self.table.see(self.table.get_children()[-1])
+        self.record_btn.config(text="Resume recording")
+
+        message = f"CURRENT OVERFLOW- emergency stop (current {values[2]} > {CURRENT_LIMIT}). Motor shut down."
+        if error is not None:
+            message += f" WARNING: shutdown command failed: {error}"
+        self.status.set(message)
+        self.update_buttons()
+
+    def toggle_recording(self):
+        if self.recording.is_set():
+            self.recording.clear()
+            self.record_btn.config(text="Resume recording")
+            self.status.set("Table recording stopped (the motor is not affected).")
+        else:
+            self.recording.set()
+            self.record_btn.config(text="Stop recording")
+            self.status.set("Table recording resumed.")
+
+    def on_start(self):
+        emergency_event.clear()      # pressing Start is the deliberate restart after an emergency stop
+        self.status.set("Starting (searching end stop, homing)...")
+
+        def done(_):
+            self.started = True
+            self.status.set("Started. Enter position and velocity, then press Move.")
+
+        self.run_in_thread(start_func, done)
+
+    def on_end(self):
+        self.status.set("Stopping...")
+
+        def done(_):
+            self.started = False
+            self.status.set("Motor stopped (shutdown).")
+
+        self.run_in_thread(endfunc, done)
+
+    def on_stop(self):
+        if self.busy:
+            # a routine is running: ask it to abort and halt the motor
+            stop_event.set()
+            self.status.set("Stopping...")
+        else:
+            # idle: send the halt directly
+            self.status.set("Stopping...")
+            self.run_in_thread(halt_motor, lambda _: self.status.set("Motor stopped by user."))
+
+    def on_move(self):
+        try:
+            mm = float(self.pos_entry.get().strip().replace(',', '.'))
+            if not math.isfinite(mm):
+                raise ValueError
+            pct = float(self.vel_entry.get().strip().replace(',', '.').rstrip('%'))
+            if not math.isfinite(pct):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid input", "Position (mm) and speed (%) must be numbers.")
+            return
+        pos = mm_to_units(mm)            # drive units sent to the motor
+        if not POS_MIN <= pos <= POS_MAX:
+            messagebox.showerror(
+                "Invalid position",
+                f"Position must be between {units_to_mm(POS_MIN):g} and {units_to_mm(POS_MAX):g} mm.")
+            return
+        if not SPEED_MIN_PCT <= pct <= SPEED_MAX_PCT:
+            messagebox.showerror("Invalid speed", f"Speed must be between {SPEED_MIN_PCT} and {SPEED_MAX_PCT} %.")
+            return
+        vel = round(pct / 100 * VELOCITY_AT_100_PCT)   # drive units sent to the motor
+        if vel == 0:
+            messagebox.showerror("Invalid speed", "A speed of 0 means the motor will not move. Use a value above 0.")
+            return
+
+        self.status.set(f"Moving to {mm:g} mm ({pos} units) at {pct:g} % speed (velocity {vel})...")
+        self.run_in_thread(
+            lambda: move_to(pos, vel),
+            lambda actual: self.status.set(
+                f"Target reached. Actual position: {units_to_mm(actual):.3f} mm ({actual} units)"),
+        )
+
+    def on_close(self):
+        if self.busy:
+            if not messagebox.askyesno("Busy", "The motor is still working. Close anyway?"):
+                return
+        self.monitor_stop.set()
+        if self.monitor_thread is not None:
+            self.monitor_thread.join(timeout=1)
+        try:
+            if self.started and node is not None:
+                node.sdo['Controlword'].raw = 0x0006   # shut the drive down
+        except Exception:
+            pass
+        try:
+            network.disconnect()
+        except Exception:
+            pass
+        self.root.destroy()
+
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
